@@ -1,8 +1,8 @@
 {
   "Nickname": "Container and Loot Patcher",
   "Visibility": "Visible",
-  "OneLineDescription": "Tweaks and compatibility fixes for Container and Leveled Item loot records.",
-  "LongDescription": "A collection of independently-toggleable tweaks and compatibility patches for Skyrim's Container and Leveled Item loot records. Currently includes: reverting 'Scarcity - Less Loot Mod' changes on boss-tagged Leveled Lists, stripping gold (and pure-gold leveled lists) out of Containers, and propagating the \"Lock Related Loot\" changes to the patch.",
+  "OneLineDescription": "Tweaks and compatibility fixes for Container and Leveled List loot records.",
+  "LongDescription": "A collection of independently-toggleable tweaks and compatibility patches for Skyrim's Container and Leveled List loot records. Currently includes: bypassing 'Scarcity - Less Loot Mod' on boss containers and NPCs, stripping gold (and pure-gold Leveled Lists) out of Containers, and propagating the \"Lock Related Loot\" changes to the patch.",
   "PreferredAutoVersioning": "Default",
   "RequiredMods": [],
   "TargetedReleases": [

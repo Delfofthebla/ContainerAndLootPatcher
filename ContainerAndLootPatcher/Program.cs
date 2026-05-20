@@ -24,8 +24,8 @@ public class Program
     {
         _state = state;
 
-        if (Settings.RevertBossChestChanges)
-            RevertBossLeveledItems(state);
+        if (Settings.BypassScarcityOnBossLoot)
+            BypassScarcityOnBossLoot(state);
 
         if (Settings.RemoveGoldFromContainers)
             RemoveGoldFromContainers(state);
@@ -40,61 +40,150 @@ public class Program
         "Scarcity - Less Loot Mod.esp"
     };
     
-    private static void RevertBossLeveledItems(IPatcherState<ISkyrimMod, ISkyrimModGetter> state)
+    private static HashSet<FormKey> _scarcityAffectedLists = new();
+    private static Dictionary<FormKey, FormKey> _scarcityFreeCloneMap = new();
+
+    private static void BypassScarcityOnBossLoot(IPatcherState<ISkyrimMod, ISkyrimModGetter> state)
     {
-        
-        var scarcityKey = state.LoadOrder.Keys.FirstOrDefault(k => KnownScarcityPluginNames.Any(name => k.FileName.String.Equals(name, StringComparison.OrdinalIgnoreCase)));
+        var scarcityKey = state.LoadOrder.Keys.FirstOrDefault(k =>
+            KnownScarcityPluginNames.Any(name => k.FileName.String.Equals(name, StringComparison.OrdinalIgnoreCase)));
         if (scarcityKey.IsNull)
         {
-            Console.WriteLine($"Warning: Scarcity plugin not found in the load order (checked: {string.Join(", ", KnownScarcityPluginNames)}). Boss-revert step will be skipped.");
+            Console.WriteLine($"Warning: Scarcity plugin not found in the load order (checked: {string.Join(", ", KnownScarcityPluginNames)}). Boss-bypass step will be skipped.");
             return;
         }
-        
-        Console.WriteLine("Reverting Scarcity changes on 'Boss' Leveled Item records...");
-        var revertedCount = 0;
 
-        foreach (var leveledItemContext in state.LoadOrder.PriorityOrder.LeveledItem().WinningContextOverrides())
+        Console.WriteLine("Bypassing Scarcity on 'Boss' Container and NPC loot...");
+
+        _scarcityAffectedLists = new HashSet<FormKey>();
+        _scarcityFreeCloneMap = new Dictionary<FormKey, FormKey>();
+
+        foreach (var lvli in state.LoadOrder.PriorityOrder.LeveledItem().WinningOverrides())
         {
-            var leveledItem = leveledItemContext.Record;
-            if (leveledItem.EditorID is null || !leveledItem.EditorID.Contains("Boss", StringComparison.OrdinalIgnoreCase))
+            var globalKey = lvli.Global.FormKeyNullable;
+            if (globalKey is null)
                 continue;
-
-            var contexts = state.LinkCache
-                .ResolveAllContexts<ILeveledItem, ILeveledItemGetter>(leveledItem.FormKey)
-                .ToList();
-
-            var scarcityIndex = contexts.FindIndex(c => c.ModKey == scarcityKey);
-            if (scarcityIndex < 0)
-                continue;
-
-            if (scarcityIndex + 1 >= contexts.Count)
-            {
-                Console.WriteLine($"  Skipping {leveledItem.EditorID}: Scarcity is the sole record source, nothing to revert to.");
-                continue;
-            }
-
-            var preScarcityContext = contexts[scarcityIndex + 1];
-            var scarcityRecord = contexts[scarcityIndex].Record;
-            var preScarcityRecord = preScarcityContext.Record;
-
-            var winningGlobal = leveledItem.Global.FormKeyNullable;
-            var scarcityGlobal = scarcityRecord.Global.FormKeyNullable;
-            var targetGlobal = preScarcityRecord.Global.FormKeyNullable;
-
-            if (scarcityGlobal == targetGlobal)
-                continue;
-
-            if (winningGlobal != scarcityGlobal)
-                continue;
-
-            var patch = leveledItemContext.GetOrAddAsOverride(state.PatchMod);
-            patch.Global.SetTo(targetGlobal);
-            revertedCount++;
-            Console.WriteLine($"  Reverted Global on {leveledItem.EditorID} " +
-                              $"(was {winningGlobal?.ToString() ?? "null"}, now {targetGlobal?.ToString() ?? "null"})");
+            if (globalKey.Value.ModKey == scarcityKey)
+                _scarcityAffectedLists.Add(lvli.FormKey);
         }
 
-        Console.WriteLine($"Reverted {revertedCount} Boss Leveled Item record(s).");
+        if (_scarcityAffectedLists.Count == 0)
+        {
+            Console.WriteLine("  No Leveled Lists currently use a Scarcity Global — nothing to bypass.");
+            return;
+        }
+        Console.WriteLine($"  Identified {_scarcityAffectedLists.Count} Scarcity-gated Leveled List(s).");
+
+        var containersPatched = 0;
+        var npcsPatched = 0;
+
+        foreach (var containerCtx in state.LoadOrder.PriorityOrder.Container().WinningContextOverrides())
+        {
+            var container = containerCtx.Record;
+            if (container.EditorID is null || !container.EditorID.Contains("Boss", StringComparison.OrdinalIgnoreCase))
+                continue;
+            if (container.Items is null || container.Items.Count == 0)
+                continue;
+            if (!container.Items.Any(e => _scarcityAffectedLists.Contains(e.Item.Item.FormKey)))
+                continue;
+
+            var patch = containerCtx.GetOrAddAsOverride(state.PatchMod);
+            var rewired = RewireScarcityRefsInItemList(state, patch.Items);
+            if (rewired == 0)
+                continue;
+
+            containersPatched++;
+            Console.WriteLine($"  Container {container.EditorID}: rewired {rewired} Scarcity-gated entry/entries");
+        }
+
+        foreach (var npcCtx in state.LoadOrder.PriorityOrder.Npc().WinningContextOverrides())
+        {
+            var npc = npcCtx.Record;
+            if (npc.EditorID is null || !npc.EditorID.Contains("Boss", StringComparison.OrdinalIgnoreCase))
+                continue;
+            if (npc.Items is null || npc.Items.Count == 0)
+                continue;
+            if (!npc.Items.Any(e => _scarcityAffectedLists.Contains(e.Item.Item.FormKey)))
+                continue;
+
+            var patch = npcCtx.GetOrAddAsOverride(state.PatchMod);
+            var rewired = RewireScarcityRefsInItemList(state, patch.Items);
+            if (rewired == 0)
+                continue;
+
+            npcsPatched++;
+            Console.WriteLine($"  NPC {npc.EditorID}: rewired {rewired} Scarcity-gated entry/entries");
+        }
+
+        Console.WriteLine($"Patched {containersPatched} container(s) and {npcsPatched} NPC(s) using {_scarcityFreeCloneMap.Count} Scarcity-free Leveled List clone(s).");
+    }
+
+    private static int RewireScarcityRefsInItemList(IPatcherState<ISkyrimMod, ISkyrimModGetter> state, IList<ContainerEntry>? items)
+    {
+        if (items is null || items.Count == 0)
+            return 0;
+
+        var count = 0;
+        foreach (var entry in items)
+        {
+            var refKey = entry.Item.Item.FormKey;
+            if (!_scarcityAffectedLists.Contains(refKey))
+                continue;
+
+            var cloneKey = GetOrCreateScarcityFreeClone(state, refKey);
+            entry.Item.Item.SetTo(cloneKey);
+            count++;
+        }
+        return count;
+    }
+
+    private static FormKey GetOrCreateScarcityFreeClone(IPatcherState<ISkyrimMod, ISkyrimModGetter> state, FormKey originalKey)
+    {
+        if (_scarcityFreeCloneMap.TryGetValue(originalKey, out var existing))
+            return existing;
+
+        if (!state.LinkCache.TryResolve<ILeveledItemGetter>(originalKey, out var original))
+            return originalKey;
+
+        var clone = new LeveledItem(state.PatchMod.GetNextFormKey(), state.PatchMod.SkyrimRelease)
+        {
+            EditorID = BuildCloneEditorId(original.EditorID, originalKey)
+        };
+        state.PatchMod.LeveledItems.Add(clone);
+        _scarcityFreeCloneMap[originalKey] = clone.FormKey;
+
+        clone.ChanceNone = original.ChanceNone;
+        clone.Flags = original.Flags;
+        // Global is deliberately left null — that's the whole point of the clone.
+
+        if (original.Entries is not null && original.Entries.Count > 0)
+        {
+            clone.Entries = new Noggog.ExtendedList<LeveledItemEntry>();
+            foreach (var entryGetter in original.Entries)
+            {
+                var newEntry = entryGetter.DeepCopy();
+                if (newEntry.Data is not null && _scarcityAffectedLists.Contains(newEntry.Data.Reference.FormKey))
+                {
+                    var subCloneKey = GetOrCreateScarcityFreeClone(state, newEntry.Data.Reference.FormKey);
+                    newEntry.Data.Reference.SetTo(subCloneKey);
+                }
+                clone.Entries.Add(newEntry);
+            }
+        }
+
+        return clone.FormKey;
+    }
+
+    private static string BuildCloneEditorId(string? originalEditorId, FormKey originalKey)
+    {
+        const string suffix = "_CLP";
+        const int maxLength = 99;
+        var baseId = string.IsNullOrEmpty(originalEditorId)
+            ? $"LVLI_{originalKey.IDString()}"
+            : originalEditorId;
+        if (baseId.Length + suffix.Length > maxLength)
+            baseId = baseId.Substring(0, maxLength - suffix.Length);
+        return baseId + suffix;
     }
 
     private const string GoldAnchorEditorId = "Gold001";
@@ -109,7 +198,7 @@ public class Program
             return;
         }
 
-        Console.WriteLine($"  Identified {goldFormKeys.Count} gold-equivalent FormKey(s) (Gold001 plus Leveled Items that resolve to only gold).");
+        Console.WriteLine($"  Identified {goldFormKeys.Count} gold-equivalent FormKey(s) (Gold001 plus Leveled Lists that resolve to only gold).");
         var containerCount = 0;
         var entryCount = 0;
 
