@@ -1,4 +1,3 @@
-using Mutagen.Bethesda.Plugins;
 using Mutagen.Bethesda.WPF.Reflection.Attributes;
 
 namespace ContainerAndLootPatcher;

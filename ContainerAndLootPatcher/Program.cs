@@ -32,18 +32,57 @@ public class Program
     {
         _state = state;
 
+        var anyPurgeEnabled = Settings.RemoveGoldFromContainers || Settings.RemoveLockpicksFromContainers;
+        var needAnchorSets = anyPurgeEnabled || Settings.BypassScarcityOnBossLoot;
+
+        // Build anchor-equivalent sets up front so they can be shared between
+        // boss-bypass clone filtering and the purges themselves.
+        HashSet<FormKey> goldAnchorEquivalents = [];
+        HashSet<FormKey> lockpickAnchorEquivalents = [];
+        HashSet<FormKey> allAnchorEquivalents = [];
+        if (needAnchorSets)
+        {
+            goldAnchorEquivalents = BuildAnchorEquivalentSet(state, GoldPurgeRule);
+            lockpickAnchorEquivalents = BuildAnchorEquivalentSet(state, LockpickPurgeRule);
+            allAnchorEquivalents = new HashSet<FormKey>(goldAnchorEquivalents);
+            allAnchorEquivalents.UnionWith(lockpickAnchorEquivalents);
+        }
+
         if (Settings.BypassScarcityOnBossLoot)
-            BypassScarcityOnBossLoot(state);
+        {
+            // Filter from clone entries any anchor-equivalents from ENABLED purge rules,
+            // so cloned Leveled Lists don't reintroduce items the user wants stripped.
+            // Preserve verbatim any LVLI on a rule's exclusion list (e.g. LootPerkGoldenTouch)
+            // since its entire purpose is to drop the otherwise-purged item.
+            var cloneEntryFilter = new HashSet<FormKey>();
+            var cloneEntryPreserve = new HashSet<FormKey>();
+            if (Settings.RemoveGoldFromContainers)
+            {
+                cloneEntryFilter.UnionWith(goldAnchorEquivalents);
+                cloneEntryPreserve.UnionWith(GoldPurgeRule.Exclusions);
+            }
+            if (Settings.RemoveLockpicksFromContainers)
+            {
+                cloneEntryFilter.UnionWith(lockpickAnchorEquivalents);
+                cloneEntryPreserve.UnionWith(LockpickPurgeRule.Exclusions);
+            }
+            BypassScarcityOnBossLoot(state, cloneEntryFilter, cloneEntryPreserve);
+        }
 
-        var merchantContainerBases = Settings.RemoveGoldFromContainers || Settings.RemoveLockpicksFromContainers
-            ? BuildMerchantContainerBaseSet(state)
-            : [];
+        if (anyPurgeEnabled)
+        {
+            var merchantContainerBases = BuildMerchantContainerBaseSet(state);
+            var singlePurposeContainers = BuildSinglePurposeContainerSet(state, allAnchorEquivalents);
 
-        if (Settings.RemoveGoldFromContainers)
-            PurgeAnchorEquivalentsFromContainers(state, GoldPurgeRule, merchantContainerBases);
+            var containerSkipSet = new HashSet<FormKey>(merchantContainerBases);
+            containerSkipSet.UnionWith(singlePurposeContainers);
 
-        if (Settings.RemoveLockpicksFromContainers)
-            PurgeAnchorEquivalentsFromContainers(state, LockpickPurgeRule, merchantContainerBases);
+            if (Settings.RemoveGoldFromContainers)
+                PurgeAnchorEquivalentsFromContainers(state, GoldPurgeRule, goldAnchorEquivalents, containerSkipSet);
+
+            if (Settings.RemoveLockpicksFromContainers)
+                PurgeAnchorEquivalentsFromContainers(state, LockpickPurgeRule, lockpickAnchorEquivalents, containerSkipSet);
+        }
 
         if (Settings.LockRelatedLootCompatibility)
             ApplyLockRelatedLootCompatibility(state);
@@ -57,7 +96,7 @@ public class Program
     private static HashSet<FormKey> _scarcityAffectedLists = [];
     private static Dictionary<FormKey, FormKey> _scarcityFreeCloneMap = new();
 
-    private static void BypassScarcityOnBossLoot(IPatcherState<ISkyrimMod, ISkyrimModGetter> state)
+    private static void BypassScarcityOnBossLoot(IPatcherState<ISkyrimMod, ISkyrimModGetter> state, HashSet<FormKey> cloneEntryFilter, HashSet<FormKey> cloneEntryPreserve)
     {
         LogSectionHeader("Bypass Scarcity on Boss Loot");
 
@@ -71,7 +110,7 @@ public class Program
 
         Console.WriteLine("Bypassing Scarcity on 'Boss' Container and NPC loot...");
 
-        _scarcityAffectedLists = new HashSet<FormKey>();
+        _scarcityAffectedLists = [];
         _scarcityFreeCloneMap = new Dictionary<FormKey, FormKey>();
 
         foreach (var lvli in state.LoadOrder.PriorityOrder.LeveledItem().WinningOverrides())
@@ -89,6 +128,8 @@ public class Program
             return;
         }
         Console.WriteLine($"  Identified {_scarcityAffectedLists.Count} Scarcity-gated Leveled List(s).");
+        if (cloneEntryFilter.Count > 0)
+            Console.WriteLine($"  Cloned Leveled Lists will drop {cloneEntryFilter.Count} purge-set entry/entries; {cloneEntryPreserve.Count} excluded LVLI(s) will be cloned verbatim.");
 
         var containersPatched = 0;
         var npcsPatched = 0;
@@ -104,7 +145,7 @@ public class Program
                 continue;
 
             var patch = containerCtx.GetOrAddAsOverride(state.PatchMod);
-            var rewired = RewireScarcityRefsInItemList(state, patch.Items);
+            var rewired = RewireScarcityRefsInItemList(state, patch.Items, cloneEntryFilter, cloneEntryPreserve);
             if (rewired == 0)
                 continue;
 
@@ -123,7 +164,7 @@ public class Program
                 continue;
 
             var patch = npcCtx.GetOrAddAsOverride(state.PatchMod);
-            var rewired = RewireScarcityRefsInItemList(state, patch.Items);
+            var rewired = RewireScarcityRefsInItemList(state, patch.Items, cloneEntryFilter, cloneEntryPreserve);
             if (rewired == 0)
                 continue;
 
@@ -134,7 +175,7 @@ public class Program
         Console.WriteLine($"Patched {containersPatched} container(s) and {npcsPatched} NPC(s) using {_scarcityFreeCloneMap.Count} Scarcity-free Leveled List clone(s).");
     }
 
-    private static int RewireScarcityRefsInItemList(IPatcherState<ISkyrimMod, ISkyrimModGetter> state, IList<ContainerEntry>? items)
+    private static int RewireScarcityRefsInItemList(IPatcherState<ISkyrimMod, ISkyrimModGetter> state, IList<ContainerEntry>? items, HashSet<FormKey> cloneEntryFilter, HashSet<FormKey> cloneEntryPreserve)
     {
         if (items is null || items.Count == 0)
             return 0;
@@ -146,14 +187,20 @@ public class Program
             if (!_scarcityAffectedLists.Contains(refKey))
                 continue;
 
-            var cloneKey = GetOrCreateScarcityFreeClone(state, refKey);
+            // If this Scarcity-gated ref is itself in the purge filter (e.g. a pure-gold LVLI),
+            // skip the rewire and let the gold/lockpick purge remove it cleanly. Otherwise we'd
+            // create an empty clone and leave a useless reference behind on the container.
+            if (cloneEntryFilter.Contains(refKey))
+                continue;
+
+            var cloneKey = GetOrCreateScarcityFreeClone(state, refKey, cloneEntryFilter, cloneEntryPreserve);
             entry.Item.Item.SetTo(cloneKey);
             count++;
         }
         return count;
     }
 
-    private static FormKey GetOrCreateScarcityFreeClone(IPatcherState<ISkyrimMod, ISkyrimModGetter> state, FormKey originalKey)
+    private static FormKey GetOrCreateScarcityFreeClone(IPatcherState<ISkyrimMod, ISkyrimModGetter> state, FormKey originalKey, HashSet<FormKey> cloneEntryFilter, HashSet<FormKey> cloneEntryPreserve)
     {
         if (_scarcityFreeCloneMap.TryGetValue(originalKey, out var existing))
             return existing;
@@ -172,19 +219,46 @@ public class Program
         clone.Flags = original.Flags;
         // Global is deliberately left null - that's the whole point of the clone.
 
-        if (original.Entries is not null && original.Entries.Count > 0)
+        // LVLIs on a purge rule's exclusion list (e.g. LootPerkGoldenTouch) are cloned verbatim:
+        // their job is precisely to drop the otherwise-purged item, so we must keep their entries intact.
+        var preserveVerbatim = cloneEntryPreserve.Contains(originalKey);
+
+        if (original.Entries is null || original.Entries.Count <= 0)
+            return clone.FormKey;
+
+        clone.Entries = [];
+        foreach (var entryGetter in original.Entries)
         {
-            clone.Entries = [];
-            foreach (var entryGetter in original.Entries)
+            var newEntry = entryGetter.DeepCopy();
+
+            if (preserveVerbatim)
             {
-                var newEntry = entryGetter.DeepCopy();
-                if (newEntry.Data is not null && _scarcityAffectedLists.Contains(newEntry.Data.Reference.FormKey))
-                {
-                    var subCloneKey = GetOrCreateScarcityFreeClone(state, newEntry.Data.Reference.FormKey);
-                    newEntry.Data.Reference.SetTo(subCloneKey);
-                }
+                // Excluded LVLI: copy entries verbatim, no filtering, no recursion.
                 clone.Entries.Add(newEntry);
+                continue;
             }
+
+            if (newEntry.Data is null)
+            {
+                clone.Entries.Add(newEntry);
+                continue;
+            }
+
+            var entryRefKey = newEntry.Data.Reference.FormKey;
+
+            // Drop entries that are in any active purge set (gold, lockpicks, etc.) -
+            // this is the fix for clones carrying gold/lockpicks through to boss containers.
+            if (cloneEntryFilter.Contains(entryRefKey))
+                continue;
+
+            // Recurse into Scarcity-gated sub-lists to keep the whole subtree Scarcity-free.
+            if (_scarcityAffectedLists.Contains(entryRefKey))
+            {
+                var subCloneKey = GetOrCreateScarcityFreeClone(state, entryRefKey, cloneEntryFilter, cloneEntryPreserve);
+                newEntry.Data.Reference.SetTo(subCloneKey);
+            }
+
+            clone.Entries.Add(newEntry);
         }
 
         return clone.FormKey;
@@ -194,11 +268,14 @@ public class Program
     {
         const string suffix = "_CLP";
         const int maxLength = 99;
+        
         var baseId = string.IsNullOrEmpty(originalEditorId)
             ? $"LVLI_{originalKey.IDString()}"
             : originalEditorId;
+        
         if (baseId.Length + suffix.Length > maxLength)
-            baseId = baseId.Substring(0, maxLength - suffix.Length);
+            baseId = baseId[..(maxLength - suffix.Length)];
+        
         return baseId + suffix;
     }
 
@@ -221,11 +298,10 @@ public class Program
         Anchor: FormKey.Factory("00000A:Skyrim.esm"), // Lockpick MiscItem
         Exclusions: []);
 
-    private static void PurgeAnchorEquivalentsFromContainers(IPatcherState<ISkyrimMod, ISkyrimModGetter> state, AnchorPurgeRule rule, HashSet<FormKey> containerSkipSet)
+    private static void PurgeAnchorEquivalentsFromContainers(IPatcherState<ISkyrimMod, ISkyrimModGetter> state, AnchorPurgeRule rule, HashSet<FormKey> purgeSet, HashSet<FormKey> containerSkipSet)
     {
         LogSectionHeader($"Remove {rule.FeatureName} from Containers");
 
-        var purgeSet = BuildAnchorEquivalentSet(state, rule);
         if (purgeSet.Count == 0)
         {
             Console.WriteLine($"  Could not locate the {rule.FeatureName} anchor ({rule.Anchor}) in the load order - skipping {rule.FeatureName} removal.");
@@ -235,7 +311,7 @@ public class Program
         Console.WriteLine($"  Identified {purgeSet.Count} {rule.FeatureName}-equivalent FormKey(s) (anchor plus Leveled Lists that resolve to only {rule.FeatureName}).");
         var containerCount = 0;
         var entryCount = 0;
-        var merchantSkipped = 0;
+        var containersSkipped = 0;
 
         foreach (var containerContext in state.LoadOrder.PriorityOrder.Container().WinningContextOverrides())
         {
@@ -249,7 +325,7 @@ public class Program
 
             if (containerSkipSet.Contains(container.FormKey))
             {
-                merchantSkipped++;
+                containersSkipped++;
                 continue;
             }
 
@@ -264,7 +340,36 @@ public class Program
             Console.WriteLine($"  Removed {removed} {rule.FeatureName} entry/entries from {container.EditorID ?? container.FormKey.ToString()}");
         }
 
-        Console.WriteLine($"Modified {containerCount} Container(s), removed {entryCount} {rule.FeatureName} entry/entries total. Skipped {merchantSkipped} merchant chest(s).");
+        Console.WriteLine($"Modified {containerCount} Container(s), removed {entryCount} {rule.FeatureName} entry/entries total. Skipped {containersSkipped} excluded Container(s) (merchant chests + single-purpose).");
+    }
+
+    private static HashSet<FormKey> BuildSinglePurposeContainerSet(IPatcherState<ISkyrimMod, ISkyrimModGetter> state, HashSet<FormKey> anchorEquivalents)
+    {
+        LogSectionHeader("Build Single-Purpose Container Exclusion Set");
+
+        var set = new HashSet<FormKey>();
+        var examined = 0;
+
+        if (anchorEquivalents.Count == 0)
+        {
+            Console.WriteLine("  No anchor-equivalent FormKeys provided; no single-purpose containers can be identified.");
+            return set;
+        }
+
+        foreach (var container in state.LoadOrder.PriorityOrder.Container().WinningOverrides())
+        {
+            if (container.Items is null || container.Items.Count == 0)
+                continue;
+            
+            examined++;
+
+            var allMatch = container.Items.All(entry => anchorEquivalents.Contains(entry.Item.Item.FormKey));
+            if (allMatch)
+                set.Add(container.FormKey);
+        }
+
+        Console.WriteLine($"  Examined {examined} Container(s) with items; identified {set.Count} as single-purpose (item list contains only anchor-equivalents).");
+        return set;
     }
 
     private static HashSet<FormKey> BuildMerchantContainerBaseSet(IPatcherState<ISkyrimMod, ISkyrimModGetter> state)

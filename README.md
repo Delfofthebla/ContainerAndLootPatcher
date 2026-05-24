@@ -1,69 +1,44 @@
 # Container and Loot Patcher
 
-A Synthesis patcher for Skyrim Special Edition that bundles a handful of independently-toggleable tweaks and compatibility patches for Container and Leveled List loot records.
-
-Each feature is gated behind its own boolean setting and runs in isolation — enable any combination, leave the rest off.
+A Synthesis patcher for Skyrim Special Edition that bundles a handful of independently-toggleable tweaks and compatibility patches for container and Leveled List loot. Each feature has its own toggle.
 
 ## Features
 
-### 1. Bypass Scarcity on boss chests and NPCs
+### Bypass Scarcity on boss chests and NPCs
 
-The [Scarcity - Less Loot Mod](https://www.nexusmods.com/skyrimspecialedition/mods/2304) reduces overall loot by adding "loot chance" Global form records (`75LootChanceNone`, `50LootChanceNone`, `0LootChanceNone`, etc.) and attaching them to the `LVLG - Global` field on a large number of vanilla Leveled List records. The effect is a per-roll chance that the leveled list returns nothing.
+[Scarcity - Less Loot Mod](https://www.nexusmods.com/skyrimspecialedition/mods/2304) reduces overall loot by giving most vanilla Leveled Lists a chance to roll nothing. Because those same Leveled Lists are shared between regular chests, enemies, and boss chests, you can't simply undo Scarcity on boss loot without also undoing it everywhere else.
 
-The catch is that the same Leveled List records are referenced by regular chests, individual enemies, and boss chests alike. Simply nulling the Global on a boss-tagged Leveled List doesn't help — the master list contains other Scarcity-gated sub-lists that still roll for nothing. Worse, undoing the Global on those shared lists would also undo Scarcity for non-boss loot.
+This feature gives boss-tagged containers and NPCs (any record whose EditorID contains `Boss`) their own private Scarcity-free copy of the loot tree. End result: bosses drop full loot again while the rest of the world stays scarce.
 
-This feature solves that by giving boss containers/NPCs their own private branch of the Leveled List tree:
+Supported plugin names: `Scarcity SE - Less Loot Mod.esp`, `Scarcity - Less Loot Mod.esp`. If neither is present, this step is skipped.
 
-1. The patcher detects the Scarcity plugin by file name (`Scarcity SE - Less Loot Mod.esp` or `Scarcity - Less Loot Mod.esp`).
-2. It builds a set of "Scarcity-gated" Leveled Lists: any Leveled List whose winning `Global` value originates from the Scarcity plugin.
-3. For every `Container` and `Npc` whose EditorID contains `Boss`, each item entry that points to a Scarcity-gated Leveled List is replaced with a reference to a Scarcity-free **clone** of that list. The clone:
-   - Has its own fresh FormKey in the patch.
-   - Has EditorID `{OriginalEditorID}_CLP`.
-   - Copies the original's flags, `ChanceNone`, and entries.
-   - Has its `Global` field nulled out.
-   - Has its sub-list entries recursively rewritten to point at Scarcity-free clones of any Scarcity-gated child lists.
-4. Clones are deduplicated by original FormKey — a list reached from many bosses is cloned exactly once.
+### Remove Gold from Container item lists
 
-End result: boss-tagged containers and NPCs roll against a Scarcity-free copy of their loot tree, while every other container/NPC in the game still rolls against Scarcity's reduced tables.
+Strips gold out of containers. Any container whose item list references gold (directly, or indirectly through a Leveled List) has those entries removed. Containers with mixed loot (gold alongside weapons, armor, etc.) only lose the gold portion; everything else is left alone.
 
-### 2. Remove Gold from Container item lists
+### Remove Lockpicks from Container item lists
 
-When enabled, any Container record whose inventory item list references gold — directly via the `Gold001` MiscItem, or indirectly via a Leveled List whose entries are *all* gold — will have those entries stripped out.
+Same as gold removal, but for lockpicks.
 
-The patcher is anchored on the `Gold001` FormKey (`0000000F:Skyrim.esm`). It then iteratively expands a "gold-equivalent" set: any Leveled List whose every entry references something already in the set is itself added to the set. This continues until no more additions are found, naturally catching nested lists like `LootGoldChange` → `Gold001`, and `LootDwarvenGoldBoss` → `LootGoldChange` → `Gold001`. Any Leveled List that mixes gold with non-gold loot is left alone.
+### LockRelatedLoot compatibility
 
-Finally every Container's `Items` list is swept for entries that reference any FormKey in the resolved set, and those entries are removed.
+When using [LockRelatedLoot](https://www.nexusmods.com/skyrimspecialedition/mods/35156), it's possible that conflicting mods (or your Bashed Patch) can end up removing the script attachments that the mod makes. When `LockRelatedLoot.esp` is in the load order, this step copies any LockRelatedLoot scripts that aren't already present on the winning container override into our patch. Does nothing if there are no conflicts or issues. If `LockRelatedLoot.esp` is not present, this step is skipped.
 
-**Exceptions.** Some Leveled Lists in the game are intentionally all-gold but drive perk/quest/script behavior — stripping them would break those systems. These are kept on a hardcoded exclusion list and are never added to the gold set, so any container that references them keeps the entry. Current exclusions:
+## Exemptions
 
-- `LootPerkGoldenTouch` (`0010FD8B:Skyrim.esm`) — Transmute perk's gold drop.
-- `PerkMasterTraderGold` (`0010C1CC:Skyrim.esm`) — Master Trader speech perk's extra gold.
+The gold and lockpick removal steps automatically skip a few categories of records to avoid breaking stuff. These exemptions apply regardless of which toggles are enabled.
 
-### 3. Remove Lockpicks from Container item lists
+- **Merchant chests** detected via the `MerchantContainer` field on Faction records. Vendor inventory is left alone so merchants still have their normal inventories.
+- **Single-purpose containers** any container whose entire item list is gold and/or lockpicks. Coin purses, lockpick stashes, and similar dedicated containers keep their contents.
+- **Perk- and quest-driven Leveled Lists** a small hardcoded list of vanilla records whose job is specifically to drop gold (e.g. the Transmute perk's gold drop and the Master Trader speech perk's extra gold). These are never classified as gold for purge purposes, and boss-bypass clones of them keep their original contents.
 
-Identical mechanics to the gold removal step, but anchored on the `Lockpick` MiscItem FormKey (`0000000A:Skyrim.esm`). Container entries that reference `Lockpick` directly or any Leveled List that resolves to only lockpicks are stripped. Leveled Lists that mix lockpicks with other loot are left alone.
-
-No exclusions are currently configured for the lockpick feature.
-
-### 4. LockRelatedLoot compatibility
-
-When enabled and `LockRelatedLoot.esp` is present in the load order, the patcher copies every script entry that LockRelatedLoot adds to Container records onto the winning override (i.e. into our patch). This works around bashed patches that fail to carry these script attachments through.
-
-For each Container that LockRelatedLoot overrides, the patcher inspects the winning override's `VirtualMachineAdapter`. Any script in LockRelatedLoot's version that isn't already present on the winning override (matched by script name, case-insensitive) is deep-copied onto the patched record. Existing scripts are left untouched so we don't clobber other mods' script modifications.
-
-If LockRelatedLoot is itself the winning override for a record, nothing is copied — its scripts are already winning.
+When the boss-bypass feature creates Scarcity-free clones, those clones honor the gold and lockpick removal toggles too--so you won't see purged loot reappearing on bosses through the back door.
 
 ## Settings
 
-| Setting | Description |
+| Setting | Effect |
 | --- | --- |
-| Bypass Scarcity on boss chests and NPCs | Toggle for the first tweak above. |
-| Remove Gold from Container item lists | Toggle for the second tweak above. |
-| Remove Lockpicks from Container item lists | Toggle for the third tweak above. |
-| LockRelatedLoot compatibility | Toggle for the fourth tweak above. |
-
-## Notes
-
-- If the Scarcity plugin is not present in the load order, the boss-revert step is silently skipped. The gold-removal step still runs.
-- The gold-removal step does not depend on Scarcity being installed.
-- The LockRelatedLoot compatibility step only fires when `LockRelatedLoot.esp` is present.
+| Bypass Scarcity on boss chests and NPCs | Gives Boss-tagged containers and NPCs a Scarcity-free copy of their loot tree. |
+| Remove Gold from Container item lists | Strips gold (direct and via pure-gold Leveled Lists) from container inventories. |
+| Remove Lockpicks from Container item lists | Strips lockpicks (direct and via pure-lockpick Leveled Lists) from container inventories. |
+| LockRelatedLoot compatibility | Propagates LockRelatedLoot's container scripts when a bashed patch drops them. |
