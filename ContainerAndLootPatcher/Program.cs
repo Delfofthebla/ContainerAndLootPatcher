@@ -20,6 +20,14 @@ public class Program
     private static IPatcherState<ISkyrimMod, ISkyrimModGetter>? _state;
     internal static IPatcherState<ISkyrimMod, ISkyrimModGetter> State => _state!;
 
+    private static void LogSectionHeader(string title)
+    {
+        Console.WriteLine();
+        Console.WriteLine("============================================================");
+        Console.WriteLine($"  {title}");
+        Console.WriteLine("============================================================");
+    }
+
     private static void RunPatch(IPatcherState<ISkyrimMod, ISkyrimModGetter> state)
     {
         _state = state;
@@ -27,8 +35,15 @@ public class Program
         if (Settings.BypassScarcityOnBossLoot)
             BypassScarcityOnBossLoot(state);
 
+        var merchantContainerBases = Settings.RemoveGoldFromContainers || Settings.RemoveLockpicksFromContainers
+            ? BuildMerchantContainerBaseSet(state)
+            : [];
+
         if (Settings.RemoveGoldFromContainers)
-            RemoveGoldFromContainers(state);
+            PurgeAnchorEquivalentsFromContainers(state, GoldPurgeRule, merchantContainerBases);
+
+        if (Settings.RemoveLockpicksFromContainers)
+            PurgeAnchorEquivalentsFromContainers(state, LockpickPurgeRule, merchantContainerBases);
 
         if (Settings.LockRelatedLootCompatibility)
             ApplyLockRelatedLootCompatibility(state);
@@ -39,12 +54,13 @@ public class Program
         "Scarcity SE - Less Loot Mod.esp",
         "Scarcity - Less Loot Mod.esp"
     };
-    
-    private static HashSet<FormKey> _scarcityAffectedLists = new();
+    private static HashSet<FormKey> _scarcityAffectedLists = [];
     private static Dictionary<FormKey, FormKey> _scarcityFreeCloneMap = new();
 
     private static void BypassScarcityOnBossLoot(IPatcherState<ISkyrimMod, ISkyrimModGetter> state)
     {
+        LogSectionHeader("Bypass Scarcity on Boss Loot");
+
         var scarcityKey = state.LoadOrder.Keys.FirstOrDefault(k =>
             KnownScarcityPluginNames.Any(name => k.FileName.String.Equals(name, StringComparison.OrdinalIgnoreCase)));
         if (scarcityKey.IsNull)
@@ -69,7 +85,7 @@ public class Program
 
         if (_scarcityAffectedLists.Count == 0)
         {
-            Console.WriteLine("  No Leveled Lists currently use a Scarcity Global — nothing to bypass.");
+            Console.WriteLine("  No Leveled Lists currently use a Scarcity Global - nothing to bypass.");
             return;
         }
         Console.WriteLine($"  Identified {_scarcityAffectedLists.Count} Scarcity-gated Leveled List(s).");
@@ -154,11 +170,11 @@ public class Program
 
         clone.ChanceNone = original.ChanceNone;
         clone.Flags = original.Flags;
-        // Global is deliberately left null — that's the whole point of the clone.
+        // Global is deliberately left null - that's the whole point of the clone.
 
         if (original.Entries is not null && original.Entries.Count > 0)
         {
-            clone.Entries = new Noggog.ExtendedList<LeveledItemEntry>();
+            clone.Entries = [];
             foreach (var entryGetter in original.Entries)
             {
                 var newEntry = entryGetter.DeepCopy();
@@ -186,21 +202,40 @@ public class Program
         return baseId + suffix;
     }
 
-    private const string GoldAnchorEditorId = "Gold001";
-    private static void RemoveGoldFromContainers(IPatcherState<ISkyrimMod, ISkyrimModGetter> state)
-    {
-        Console.WriteLine("Removing gold entries from Container item lists...");
+    private sealed record AnchorPurgeRule(
+        string FeatureName,
+        FormKey Anchor,
+        HashSet<FormKey> Exclusions);
 
-        var goldFormKeys = BuildGoldFormKeySet(state);
-        if (goldFormKeys.Count == 0)
+    private static readonly AnchorPurgeRule GoldPurgeRule = new(
+        FeatureName: "gold",
+        Anchor: FormKey.Factory("00000F:Skyrim.esm"), // Gold001 MiscItem
+        Exclusions:
+        [
+            FormKey.Factory("10FD8B:Skyrim.esm"), // LootPerkGoldenTouch - Transmute perk gold drop
+            FormKey.Factory("10C1CC:Skyrim.esm") // PerkMasterTraderGold - Master Trader speech perk extra gold
+        ]);
+
+    private static readonly AnchorPurgeRule LockpickPurgeRule = new(
+        FeatureName: "lockpicks",
+        Anchor: FormKey.Factory("00000A:Skyrim.esm"), // Lockpick MiscItem
+        Exclusions: []);
+
+    private static void PurgeAnchorEquivalentsFromContainers(IPatcherState<ISkyrimMod, ISkyrimModGetter> state, AnchorPurgeRule rule, HashSet<FormKey> containerSkipSet)
+    {
+        LogSectionHeader($"Remove {rule.FeatureName} from Containers");
+
+        var purgeSet = BuildAnchorEquivalentSet(state, rule);
+        if (purgeSet.Count == 0)
         {
-            Console.WriteLine($"  Could not locate the {GoldAnchorEditorId} MiscItem in the load order — skipping gold removal.");
+            Console.WriteLine($"  Could not locate the {rule.FeatureName} anchor ({rule.Anchor}) in the load order - skipping {rule.FeatureName} removal.");
             return;
         }
 
-        Console.WriteLine($"  Identified {goldFormKeys.Count} gold-equivalent FormKey(s) (Gold001 plus Leveled Lists that resolve to only gold).");
+        Console.WriteLine($"  Identified {purgeSet.Count} {rule.FeatureName}-equivalent FormKey(s) (anchor plus Leveled Lists that resolve to only {rule.FeatureName}).");
         var containerCount = 0;
         var entryCount = 0;
+        var merchantSkipped = 0;
 
         foreach (var containerContext in state.LoadOrder.PriorityOrder.Container().WinningContextOverrides())
         {
@@ -208,36 +243,72 @@ public class Program
             if (container.Items is null || container.Items.Count == 0)
                 continue;
 
-            var matchCount = container.Items.Count(e => goldFormKeys.Contains(e.Item.Item.FormKey));
+            var matchCount = container.Items.Count(e => purgeSet.Contains(e.Item.Item.FormKey));
             if (matchCount == 0)
                 continue;
 
+            if (containerSkipSet.Contains(container.FormKey))
+            {
+                merchantSkipped++;
+                continue;
+            }
+
             var patch = containerContext.GetOrAddAsOverride(state.PatchMod);
-            var removed = patch.Items?.RemoveAll(e => goldFormKeys.Contains(e.Item.Item.FormKey)) ?? 0;
+            var removed = patch.Items?.RemoveAll(e => purgeSet.Contains(e.Item.Item.FormKey)) ?? 0;
 
             if (removed == 0)
                 continue;
 
             containerCount++;
             entryCount += removed;
-            Console.WriteLine($"  Removed {removed} gold entry/entries from {container.EditorID ?? container.FormKey.ToString()}");
+            Console.WriteLine($"  Removed {removed} {rule.FeatureName} entry/entries from {container.EditorID ?? container.FormKey.ToString()}");
         }
 
-        Console.WriteLine($"Modified {containerCount} Container(s), removed {entryCount} gold entry/entries total.");
+        Console.WriteLine($"Modified {containerCount} Container(s), removed {entryCount} {rule.FeatureName} entry/entries total. Skipped {merchantSkipped} merchant chest(s).");
     }
 
-    private static HashSet<FormKey> BuildGoldFormKeySet(IPatcherState<ISkyrimMod, ISkyrimModGetter> state)
+    private static HashSet<FormKey> BuildMerchantContainerBaseSet(IPatcherState<ISkyrimMod, ISkyrimModGetter> state)
     {
-        var goldFormKeys = new HashSet<FormKey>();
+        LogSectionHeader("Build Merchant Chest Exclusion Set");
+        
+        var set = new HashSet<FormKey>();
+        var factionsWithRef = 0;
+        var unresolvedRefs = 0;
 
-        foreach (var misc in state.LoadOrder.PriorityOrder.MiscItem().WinningOverrides())
+        foreach (var faction in state.LoadOrder.PriorityOrder.Faction().WinningOverrides())
         {
-            if (string.Equals(misc.EditorID, GoldAnchorEditorId, StringComparison.OrdinalIgnoreCase))
-                goldFormKeys.Add(misc.FormKey);
+            var merchantRefKey = faction.MerchantContainer.FormKey;
+            if (merchantRefKey.IsNull)
+                continue;
+
+            factionsWithRef++;
+
+            if (!state.LinkCache.TryResolve<IPlacedObjectGetter>(merchantRefKey, out var refr))
+            {
+                unresolvedRefs++;
+                continue;
+            }
+
+            var baseKey = refr.Base.FormKey;
+            if (baseKey.IsNull)
+                continue;
+
+            set.Add(baseKey);
         }
 
-        if (goldFormKeys.Count == 0)
-            return goldFormKeys;
+        Console.WriteLine($"  Found {factionsWithRef} Faction(s) with a Merchant Container reference; resolved to {set.Count} distinct base Container record(s)" +
+                          (unresolvedRefs > 0 ? $" ({unresolvedRefs} REFR(s) could not be resolved)" : "") + ".");
+        return set;
+    }
+
+    private static HashSet<FormKey> BuildAnchorEquivalentSet(IPatcherState<ISkyrimMod, ISkyrimModGetter> state, AnchorPurgeRule rule)
+    {
+        var set = new HashSet<FormKey>();
+
+        if (!state.LinkCache.TryResolve<Mutagen.Bethesda.Plugins.Records.IMajorRecordGetter>(rule.Anchor, out _))
+            return set;
+
+        set.Add(rule.Anchor);
 
         var leveledItems = state.LoadOrder.PriorityOrder.LeveledItem().WinningOverrides().ToList();
 
@@ -247,43 +318,47 @@ public class Program
             changed = false;
             foreach (var lvli in leveledItems)
             {
-                if (goldFormKeys.Contains(lvli.FormKey))
+                if (set.Contains(lvli.FormKey))
+                    continue;
+
+                if (rule.Exclusions.Contains(lvli.FormKey))
                     continue;
 
                 if (lvli.Entries is null || lvli.Entries.Count == 0)
                     continue;
 
-                var allGold = true;
+                var allMatch = true;
                 foreach (var entry in lvli.Entries)
                 {
                     var refKey = entry.Data?.Reference.FormKey;
-                    if (refKey is null || !goldFormKeys.Contains(refKey.Value))
+                    if (refKey is null || !set.Contains(refKey.Value))
                     {
-                        allGold = false;
+                        allMatch = false;
                         break;
                     }
                 }
 
-                if (allGold)
+                if (allMatch)
                 {
-                    goldFormKeys.Add(lvli.FormKey);
+                    set.Add(lvli.FormKey);
                     changed = true;
                 }
             }
         } while (changed);
 
-        return goldFormKeys;
+        return set;
     }
 
     private const string LockRelatedLootPluginName = "LockRelatedLoot.esp";
     private static void ApplyLockRelatedLootCompatibility(IPatcherState<ISkyrimMod, ISkyrimModGetter> state)
     {
-        var lrlKey = state.LoadOrder.Keys.FirstOrDefault(
-            k => k.FileName.String.Equals(LockRelatedLootPluginName, StringComparison.OrdinalIgnoreCase));
+        LogSectionHeader("LockRelatedLoot Compatibility");
+
+        var lrlKey = state.LoadOrder.Keys.FirstOrDefault(k => k.FileName.String.Equals(LockRelatedLootPluginName, StringComparison.OrdinalIgnoreCase));
 
         if (lrlKey.IsNull)
         {
-            Console.WriteLine($"{LockRelatedLootPluginName} not present in load order — skipping LRL compatibility step.");
+            Console.WriteLine($"{LockRelatedLootPluginName} not present in load order - skipping LRL compatibility step.");
             return;
         }
 
@@ -292,7 +367,7 @@ public class Program
         var lrlMod = state.LoadOrder[lrlKey].Mod;
         if (lrlMod is null)
         {
-            Console.WriteLine($"  Could not read {LockRelatedLootPluginName} — skipping.");
+            Console.WriteLine($"  Could not read {LockRelatedLootPluginName} - skipping.");
             return;
         }
 

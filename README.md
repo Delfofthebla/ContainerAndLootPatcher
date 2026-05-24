@@ -30,11 +30,22 @@ End result: boss-tagged containers and NPCs roll against a Scarcity-free copy of
 
 When enabled, any Container record whose inventory item list references gold — directly via the `Gold001` MiscItem, or indirectly via a Leveled List whose entries are *all* gold — will have those entries stripped out.
 
-The patcher is anchored on the `Gold001` EditorID. It then iteratively expands a "gold-equivalent" set: any Leveled List whose every entry references something already in the set is itself added to the set. This continues until no more additions are found, naturally catching nested lists like `LootGoldChange` → `Gold001`, and `LootDwarvenGoldBoss` → `LootGoldChange` → `Gold001`. Any Leveled List that mixes gold with non-gold loot is left alone.
+The patcher is anchored on the `Gold001` FormKey (`0000000F:Skyrim.esm`). It then iteratively expands a "gold-equivalent" set: any Leveled List whose every entry references something already in the set is itself added to the set. This continues until no more additions are found, naturally catching nested lists like `LootGoldChange` → `Gold001`, and `LootDwarvenGoldBoss` → `LootGoldChange` → `Gold001`. Any Leveled List that mixes gold with non-gold loot is left alone.
 
 Finally every Container's `Items` list is swept for entries that reference any FormKey in the resolved set, and those entries are removed.
 
-### 3. LockRelatedLoot compatibility
+**Exceptions.** Some Leveled Lists in the game are intentionally all-gold but drive perk/quest/script behavior — stripping them would break those systems. These are kept on a hardcoded exclusion list and are never added to the gold set, so any container that references them keeps the entry. Current exclusions:
+
+- `LootPerkGoldenTouch` (`0010FD8B:Skyrim.esm`) — Transmute perk's gold drop.
+- `PerkMasterTraderGold` (`0010C1CC:Skyrim.esm`) — Master Trader speech perk's extra gold.
+
+### 3. Remove Lockpicks from Container item lists
+
+Identical mechanics to the gold removal step, but anchored on the `Lockpick` MiscItem FormKey (`0000000A:Skyrim.esm`). Container entries that reference `Lockpick` directly or any Leveled List that resolves to only lockpicks are stripped. Leveled Lists that mix lockpicks with other loot are left alone.
+
+No exclusions are currently configured for the lockpick feature.
+
+### 4. LockRelatedLoot compatibility
 
 When enabled and `LockRelatedLoot.esp` is present in the load order, the patcher copies every script entry that LockRelatedLoot adds to Container records onto the winning override (i.e. into our patch). This works around bashed patches that fail to carry these script attachments through.
 
@@ -48,8 +59,8 @@ If LockRelatedLoot is itself the winning override for a record, nothing is copie
 | --- | --- |
 | Bypass Scarcity on boss chests and NPCs | Toggle for the first tweak above. |
 | Remove Gold from Container item lists | Toggle for the second tweak above. |
-| LockRelatedLoot compatibility | Toggle for the third tweak above. |
-| Ignored mods | Substrings of plugin file names to skip when patching. |
+| Remove Lockpicks from Container item lists | Toggle for the third tweak above. |
+| LockRelatedLoot compatibility | Toggle for the fourth tweak above. |
 
 ## Notes
 
